@@ -252,6 +252,26 @@ def period_start(period: str) -> datetime | None:
         return now - timedelta(days=30)
     return None
 
+# ---------------------------------------------------------------------------
+# Унікальні відвідувачі (дедуплікація за IP)
+#
+# Один і той самий відвідувач може мати кілька документів у visitors_col
+# (наприклад, кожна нова сесія/чистка cookie створює новий sessionId),
+# тому пряме count_documents(...) рахує "сесії", а не реальну кількість людей.
+# Тут ми рахуємо кількість УНІКАЛЬНИХ значень поля "ip".
+# ---------------------------------------------------------------------------
+async def get_unique_visitors_count(since: datetime | None = None) -> int:
+    query = {}
+    if since is not None:
+        # lastSeen оновлюється при кожному візиті, тому фільтр по ньому
+        # коректно відбирає тих, хто був активний за потрібний період
+        query = {"lastSeen": {"$gte": since}}
+    ips = await db_call(
+        visitors_col.distinct("ip", query), default=[], raise_on_fail=False
+    ) or []
+    # На випадок відсутнього/порожнього ip у деяких документах
+    return len([ip for ip in ips if ip])
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -317,6 +337,9 @@ async def build_dashboard_text() -> str:
     except Exception:
         logger.exception("dashboard api fetch failed")
 
+    # Унікальні відвідувачі сьогодні напряму з бази (дедуплікація за IP)
+    unique_today = await get_unique_visitors_count(since=today_start)
+
     lines = [
         "🎯 *Дашборд сьогодні*", "",
         f"📦 Замовлень: *{total_count}*",
@@ -329,7 +352,8 @@ async def build_dashboard_text() -> str:
     if online is not None:
         lines.append(f"👥 Онлайн зараз: *{online}*")
     if visitors_today is not None:
-        lines.append(f"📊 Відвідувачів сьогодні: *{visitors_today}*")
+        lines.append(f"📊 Відвідувачів сьогодні (з сайту): *{visitors_today}*")
+    lines.append(f"🧑‍🤝‍🧑 Унікальних відвідувачів сьогодні: *{unique_today}*")
     lines.append(f"🎯 Конверсія: {conversion_text}")
     return "\n".join(lines)
 
@@ -489,14 +513,23 @@ async def site_analytics_cmd(msg: Message, state: FSMContext):
 
     daily = stats.get("dailyVisitors", 0)
     total = stats.get("totalVisitors", 0)
+
+    # Унікальні відвідувачі напряму з бази (дедуплікація за IP)
+    unique_today = await get_unique_visitors_count(since=today_start)
+    unique_total = await get_unique_visitors_count(since=None)
+
     conversion = f"{round(orders_today / daily * 100, 1)}%" if daily else "н/д"
+    conversion_unique = f"{round(orders_today / unique_today * 100, 1)}%" if unique_today else "н/д"
     text = (
         "📊 *Аналітика сайту*\n\n"
         f"👥 Онлайн зараз: *{online}*\n"
-        f"📈 Відвідувачів сьогодні: *{daily}*\n"
-        f"🌍 Всього відвідувачів за весь час: *{total}*\n"
+        f"📈 Відвідувачів сьогодні (з сайту): *{daily}*\n"
+        f"🧑‍🤝‍🧑 Унікальних відвідувачів сьогодні: *{unique_today}*\n"
+        f"🌍 Всього відвідувачів за весь час (з сайту): *{total}*\n"
+        f"🧑‍🤝‍🧑 Унікальних відвідувачів за весь час: *{unique_total}*\n"
         f"📦 Замовлень сьогодні: *{orders_today}*\n"
-        f"🎯 Конверсія сьогодні: *{conversion}*"
+        f"🎯 Конверсія сьогодні (з сайту): *{conversion}*\n"
+        f"🎯 Конверсія сьогодні (унікальні): *{conversion_unique}*"
     )
     await msg.answer(text, reply_markup=kb_main())
 
@@ -505,16 +538,31 @@ async def devices_cmd(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     try:
         visitors = await db_call(
-            visitors_col.find({}, {"userAgent": 1}).to_list(length=None), default=[], raise_on_fail=False
+            visitors_col.find({}, {"userAgent": 1, "ip": 1}).to_list(length=None), default=[], raise_on_fail=False
         ) or []
     except DBUnavailable:
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     if not visitors:
         return await msg.answer("📭 Ще немає даних про відвідувачів.", reply_markup=kb_main())
 
-    counts = {"Android": 0, "iPhone/iPad": 0, "Windows": 0, "Mac": 0, "Linux": 0, "Інше": 0}
+    # Дедуплікація за IP: один відвідувач враховується лише 1 раз,
+    # навіть якщо в нього кілька сесій (різні браузери/чистка cookie)
+    unique_by_ip: dict[str, str] = {}
     for v in visitors:
-        ua = (v.get("userAgent") or "").lower()
+        ip = v.get("ip")
+        if not ip:
+            continue
+        unique_by_ip[ip] = v.get("userAgent") or ""
+
+    total_sessions = len(visitors)
+    total_unique = len(unique_by_ip)
+
+    if total_unique == 0:
+        return await msg.answer("📭 Ще немає даних про відвідувачів.", reply_markup=kb_main())
+
+    counts = {"Android": 0, "iPhone/iPad": 0, "Windows": 0, "Mac": 0, "Linux": 0, "Інше": 0}
+    for ua in unique_by_ip.values():
+        ua = ua.lower()
         if "android" in ua:
             counts["Android"] += 1
         elif "iphone" in ua or "ipad" in ua:
@@ -528,12 +576,14 @@ async def devices_cmd(msg: Message, state: FSMContext):
         else:
             counts["Інше"] += 1
 
-    total = len(visitors)
-    lines = ["📱 *Пристрої відвідувачів*", ""]
+    lines = [
+        "📱 *Пристрої відвідувачів*",
+        f"_(унікальних: {total_unique} з {total_sessions} сесій)_", "",
+    ]
     for name, c in sorted(counts.items(), key=lambda x: x[1], reverse=True):
         if c == 0:
             continue
-        pct = round(c / total * 100, 1)
+        pct = round(c / total_unique * 100, 1)
         lines.append(f"{name}: {c} ({pct}%)")
     await msg.answer("\n".join(lines), reply_markup=kb_main())
 
