@@ -60,6 +60,15 @@ STATUS_EMOJI = {
     "успішно": "✅",
     "відмовлено": "❌",
 }
+# Кольорові кружечки для візуального статусу замовлення
+STATUS_COLOR = {
+    "новий": "⚪",
+    "в обробці": "🟡",
+    "відправлено": "🟠",
+    "в дорозі": "🟣",
+    "успішно": "🟢",
+    "відмовлено": "🔴",
+}
 NOT_SHIPPED_STATUSES = ["новий", "в обробці"]
 
 mongo_client: AsyncIOMotorClient | None = None
@@ -191,14 +200,14 @@ async def fmt_order_card(order: dict) -> str:
         f"🚚 Доставка: {fmt_money(order.get('deliveryCost',0))} грн\n"
         f"📈 Прибуток: {fmt_money(profit)} грн\n\n"
         f"{repeat_line}{note_line}\n\n"
-        f"📌 Статус: *{status}*"
+        f"{STATUS_COLOR.get(status,'⚪')} Статус: *{status}*"
     )
 
 def ikb_order_actions(order_id: str) -> InlineKeyboardMarkup:
     rows = []
     row = []
     for key, label in STATUS_LABELS.items():
-        row.append(InlineKeyboardButton(text=f"{STATUS_EMOJI[label]} {label}", callback_data=f"setstatus:{order_id}:{key}"))
+        row.append(InlineKeyboardButton(text=f"{STATUS_COLOR[label]} {label}", callback_data=f"setstatus:{order_id}:{key}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -224,11 +233,11 @@ class Auth(StatesGroup):
 
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🎯 Дашборд"), KeyboardButton(text="📦 Не відправлені")],
-        [KeyboardButton(text="💸 Виручка і прибуток"), KeyboardButton(text="🔥 Топ товарів")],
-        [KeyboardButton(text="👥 Онлайн зараз"), KeyboardButton(text="📊 Аналітика сайту")],
-        [KeyboardButton(text="📱 Пристрої"), KeyboardButton(text="🔍 Клієнт за телефоном")],
-        [KeyboardButton(text="📈 Онлайн за 24 год")],
+        [KeyboardButton(text="🎯 Дашборд"), KeyboardButton(text="📋 Замовлення")],
+        [KeyboardButton(text="📦 Не відправлені"), KeyboardButton(text="💸 Виручка і прибуток")],
+        [KeyboardButton(text="🔥 Топ товарів"), KeyboardButton(text="👥 Онлайн зараз")],
+        [KeyboardButton(text="📊 Аналітика сайту"), KeyboardButton(text="📱 Пристрої")],
+        [KeyboardButton(text="🔍 Клієнт за телефоном"), KeyboardButton(text="📈 Онлайн за 24 год")],
     ], resize_keyboard=True)
 
 def kb_cancel() -> ReplyKeyboardMarkup:
@@ -414,6 +423,38 @@ async def not_shipped_cmd(msg: Message, state: FSMContext):
     await msg.answer(f"📦 Не відправлено: *{len(orders)}*", reply_markup=kb_main())
     for o in orders[:15]:
         await msg.answer(await fmt_order_card(o), reply_markup=ikb_order_actions(str(o["_id"])))
+
+@dp.message(F.text == "📋 Замовлення")
+async def orders_list_cmd(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    await msg.answer("Оберіть період:", reply_markup=ikb_period("allorders"))
+
+@dp.callback_query(F.data.startswith("allorders:"))
+async def orders_list_period_cb(cb: CallbackQuery):
+    try:
+        period = cb.data.split(":")[1]
+        start = period_start(period)
+        query = {"createdAt": {"$gte": start}} if start else {}
+        orders = await db_call(
+            orders_col.find(query).sort("createdAt", -1).to_list(length=None),
+            default=[], raise_on_fail=False
+        ) or []
+        if not orders:
+            await cb.message.edit_text("📭 Замовлень за цей період немає.", reply_markup=ikb_period("allorders"))
+            await cb.answer()
+            return
+        await cb.message.edit_text(f"📋 Замовлень за період: *{len(orders)}*", reply_markup=ikb_period("allorders"))
+        await cb.answer()
+        for o in orders[:15]:
+            await cb.message.answer(await fmt_order_card(o), reply_markup=ikb_order_actions(str(o["_id"])))
+        if len(orders) > 15:
+            await cb.message.answer(f"…і ще {len(orders) - 15} замовлень. Звузьте період, щоб побачити менший список.")
+    except Exception:
+        logger.exception("orders_list_period_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
 
 @dp.message(F.text == "💸 Виручка і прибуток")
 async def revenue_cmd(msg: Message, state: FSMContext):
