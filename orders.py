@@ -217,7 +217,16 @@ def ikb_order_actions(order_id: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🚚 Вартість доставки", callback_data=f"setdelivery:{order_id}"),
         InlineKeyboardButton(text="📝 Нотатка клієнту", callback_data=f"setnote:{order_id}"),
     ])
+    rows.append([
+        InlineKeyboardButton(text="🗑 Видалити замовлення", callback_data=f"delask:{order_id}"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_delete_confirm(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"delyes:{order_id}"),
+        InlineKeyboardButton(text="↩️ Ні", callback_data=f"delno:{order_id}"),
+    ]])
 
 class SetDelivery(StatesGroup):
     typing = State()
@@ -263,26 +272,51 @@ def period_start(period: str) -> datetime | None:
 
 # ---------------------------------------------------------------------------
 # Унікальні відвідувачі (дедуплікація за IP)
-#
-# Один і той самий відвідувач може мати кілька документів у visitors_col
-# (наприклад, кожна нова сесія/чистка cookie створює новий sessionId),
-# тому пряме count_documents(...) рахує "сесії", а не реальну кількість людей.
-# Тут ми рахуємо кількість УНІКАЛЬНИХ значень поля "ip".
 # ---------------------------------------------------------------------------
 async def get_unique_visitors_count(since: datetime | None = None) -> int:
     query = {}
     if since is not None:
-        # lastSeen оновлюється при кожному візиті, тому фільтр по ньому
-        # коректно відбирає тих, хто був активний за потрібний період
         query = {"lastSeen": {"$gte": since}}
     ips = await db_call(
         visitors_col.distinct("ip", query), default=[], raise_on_fail=False
     ) or []
-    # На випадок відсутнього/порожнього ip у деяких документах
     return len([ip for ip in ips if ip])
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
+
+# ---------------------------------------------------------------------------
+# Відправка карток замовлень із запам'ятовуванням повідомлень,
+# щоб їх можна було видалити з Telegram разом із замовленням
+# ---------------------------------------------------------------------------
+async def track_message(order_id, chat_id: int, message_id: int):
+    await db_call(
+        orders_col.update_one(
+            {"_id": order_id},
+            {"$push": {"tgMessages": {"chat_id": chat_id, "message_id": message_id}}},
+        ),
+        raise_on_fail=False,
+    )
+
+async def send_order_card(chat_id: int, order: dict):
+    text = await fmt_order_card(order)
+    sent = await bot.send_message(
+        chat_id, text, reply_markup=ikb_order_actions(str(order["_id"]))
+    )
+    await track_message(order["_id"], chat_id, sent.message_id)
+    return sent
+
+async def delete_order_everywhere(order: dict, current_msg: Message | None = None):
+    refs = {(r.get("chat_id"), r.get("message_id")) for r in (order.get("tgMessages") or [])}
+    if current_msg is not None:
+        refs.add((current_msg.chat.id, current_msg.message_id))
+    for chat_id, message_id in refs:
+        if chat_id is None or message_id is None:
+            continue
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            logger.warning("Could not delete message %s in chat %s", message_id, chat_id)
 
 async def require_auth(msg: Message, state: FSMContext) -> bool:
     try:
@@ -346,7 +380,6 @@ async def build_dashboard_text() -> str:
     except Exception:
         logger.exception("dashboard api fetch failed")
 
-    # Унікальні відвідувачі сьогодні напряму з бази (дедуплікація за IP)
     unique_today = await get_unique_visitors_count(since=today_start)
 
     lines = [
@@ -422,7 +455,7 @@ async def not_shipped_cmd(msg: Message, state: FSMContext):
         return await msg.answer("📭 Усі замовлення відправлені.", reply_markup=kb_main())
     await msg.answer(f"📦 Не відправлено: *{len(orders)}*", reply_markup=kb_main())
     for o in orders[:15]:
-        await msg.answer(await fmt_order_card(o), reply_markup=ikb_order_actions(str(o["_id"])))
+        await send_order_card(msg.chat.id, o)
 
 @dp.message(F.text == "📋 Замовлення")
 async def orders_list_cmd(msg: Message, state: FSMContext):
@@ -446,7 +479,7 @@ async def orders_list_period_cb(cb: CallbackQuery):
         await cb.message.edit_text(f"📋 Замовлень за період: *{len(orders)}*", reply_markup=ikb_period("allorders"))
         await cb.answer()
         for o in orders[:15]:
-            await cb.message.answer(await fmt_order_card(o), reply_markup=ikb_order_actions(str(o["_id"])))
+            await send_order_card(cb.message.chat.id, o)
         if len(orders) > 15:
             await cb.message.answer(f"…і ще {len(orders) - 15} замовлень. Звузьте період, щоб побачити менший список.")
     except Exception:
@@ -555,7 +588,6 @@ async def site_analytics_cmd(msg: Message, state: FSMContext):
     daily = stats.get("dailyVisitors", 0)
     total = stats.get("totalVisitors", 0)
 
-    # Унікальні відвідувачі напряму з бази (дедуплікація за IP)
     unique_today = await get_unique_visitors_count(since=today_start)
     unique_total = await get_unique_visitors_count(since=None)
 
@@ -586,8 +618,6 @@ async def devices_cmd(msg: Message, state: FSMContext):
     if not visitors:
         return await msg.answer("📭 Ще немає даних про відвідувачів.", reply_markup=kb_main())
 
-    # Дедуплікація за IP: один відвідувач враховується лише 1 раз,
-    # навіть якщо в нього кілька сесій (різні браузери/чистка cookie)
     unique_by_ip: dict[str, str] = {}
     for v in visitors:
         ip = v.get("ip")
@@ -659,7 +689,7 @@ async def lookup_customer_save(msg: Message, state: FSMContext):
     )
     await msg.answer(text, reply_markup=kb_main())
     for o in orders[:5]:
-        await msg.answer(await fmt_order_card(o), reply_markup=ikb_order_actions(str(o["_id"])))
+        await send_order_card(msg.chat.id, o)
 
 @dp.message(F.text == "📈 Онлайн за 24 год")
 async def online_history_cmd(msg: Message, state: FSMContext):
@@ -705,6 +735,62 @@ async def set_status_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+# ---------------------------------------------------------------------------
+# Видалення замовлення (з підтвердженням): з БД і з Telegram
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data.startswith("delask:"))
+async def delete_ask_cb(cb: CallbackQuery):
+    try:
+        if not await is_authorized(cb.from_user.id):
+            return await cb.answer("Немає доступу", show_alert=True)
+        order_id = cb.data.split(":")[1]
+        await cb.message.edit_reply_markup(reply_markup=ikb_delete_confirm(order_id))
+        await cb.answer("Підтвердіть видалення")
+    except Exception:
+        logger.exception("delete_ask_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("delno:"))
+async def delete_cancel_cb(cb: CallbackQuery):
+    try:
+        order_id = cb.data.split(":")[1]
+        await cb.message.edit_reply_markup(reply_markup=ikb_order_actions(order_id))
+        await cb.answer("Скасовано")
+    except Exception:
+        logger.exception("delete_cancel_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("delyes:"))
+async def delete_confirm_cb(cb: CallbackQuery):
+    try:
+        if not await is_authorized(cb.from_user.id):
+            return await cb.answer("Немає доступу", show_alert=True)
+        order_id = cb.data.split(":")[1]
+        oid = ObjectId(order_id)
+        order = await db_call(orders_col.find_one({"_id": oid}))
+        if not order:
+            try:
+                await cb.message.delete()
+            except Exception:
+                pass
+            return await cb.answer("Замовлення вже видалено", show_alert=True)
+
+        await db_call(orders_col.delete_one({"_id": oid}))
+        await delete_order_everywhere(order, current_msg=cb.message)
+        await cb.answer("🗑 Замовлення видалено")
+    except Exception:
+        logger.exception("delete_confirm_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
 @dp.callback_query(F.data.startswith("setdelivery:"))
 async def set_delivery_start(cb: CallbackQuery, state: FSMContext):
     try:
@@ -738,7 +824,7 @@ async def set_delivery_save(msg: Message, state: FSMContext):
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     if not order:
         return await msg.answer("Замовлення не знайдено.", reply_markup=kb_main())
-    await msg.answer(await fmt_order_card(order), reply_markup=ikb_order_actions(order_id))
+    await send_order_card(msg.chat.id, order)
 
 @dp.callback_query(F.data.startswith("setnote:"))
 async def set_note_start(cb: CallbackQuery, state: FSMContext):
@@ -773,7 +859,7 @@ async def set_note_save(msg: Message, state: FSMContext):
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     await msg.answer("✅ Нотатку збережено.", reply_markup=kb_main())
     if order:
-        await msg.answer(await fmt_order_card(order), reply_markup=ikb_order_actions(order_id))
+        await send_order_card(msg.chat.id, order)
 
 online_alert_active = False
 site_down_active = False
@@ -788,10 +874,9 @@ async def new_order_poll_task():
             ) or []
             uids = await get_all_uids()
             for order in new_orders:
-                text = await fmt_order_card(order)
                 for uid in uids:
                     try:
-                        await bot.send_message(uid, text, reply_markup=ikb_order_actions(str(order["_id"])))
+                        await send_order_card(uid, order)
                     except Exception:
                         logger.exception("Failed to send new order notice to %s", uid)
                 await db_call(orders_col.update_one({"_id": order["_id"]}, {"$set": {"notified": True}}), raise_on_fail=False)
