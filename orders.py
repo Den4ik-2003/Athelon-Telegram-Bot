@@ -170,6 +170,39 @@ def esc(v) -> str:
     return re.sub(r"([_*`\[])", r"\\\1", str(v if v is not None else ""))
 
 
+CARRIER_KEYS = (
+    "carrier", "carrierName", "deliveryService", "delivery_service",
+    "shippingMethod", "shipping_method", "shippingCarrier", "deliveryMethod",
+    "delivery_method", "service", "courier", "postService", "post",
+)
+PAYMENT_LABELS = {"card": "картка", "cash": "накладений платіж", "cod": "накладений платіж"}
+
+
+def pick_field(order: dict, keys: tuple) -> str:
+    sources = [order]
+    for container in ("customer", "delivery", "shipping", "deliveryInfo", "shippingInfo"):
+        sub = order.get(container)
+        if isinstance(sub, dict):
+            sources.append(sub)
+    for src in sources:
+        for key in keys:
+            value = src.get(key)
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("title") or value.get("carrier")
+            if value not in (None, ""):
+                return str(value)
+    return ""
+
+
+def get_carrier(order: dict) -> str:
+    return pick_field(order, CARRIER_KEYS)
+
+
+def get_payment(order: dict) -> str:
+    raw = pick_field(order, ("payment", "paymentMethod", "payment_method"))
+    return PAYMENT_LABELS.get(raw, raw)
+
+
 def fmt_money(v: float) -> str:
     return f"{v:,.0f}".replace(",", " ")
 
@@ -302,8 +335,11 @@ async def fmt_order_card(order: dict) -> str:
 
     repeat_line = "🆕 Новий клієнт" if repeat_count <= 1 else f"🔄 Повторний клієнт: {repeat_count} замовлень"
     note_line = f"\n📝 Нотатка: {esc(note)}" if note else ""
-    carrier = order.get("carrier") or customer.get("carrier") or ""
-    carrier_line = f"\n🚛 Перевізник: {esc(carrier)}" if carrier else ""
+    carrier = get_carrier(order) or "не вказано"
+    payment = get_payment(order)
+    carrier_line = f"\n🚛 Перевізник: *{esc(carrier)}*"
+    if payment:
+        carrier_line += f"\n💳 Оплата: {esc(payment)}"
     full_name = f"{customer.get('name', '')} {customer.get('surname', '')}".strip()
 
     return (
