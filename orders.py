@@ -27,6 +27,7 @@ from aiogram.types import (
 )
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
 logging.basicConfig(
@@ -194,8 +195,48 @@ def pick_field(order: dict, keys: tuple) -> str:
     return ""
 
 
+def scan_carrier(value, depth: int = 0) -> str:
+    if depth > 3:
+        return ""
+    if isinstance(value, str):
+        low = value.lower()
+        if "укрпошт" in low or "укр пошт" in low or "ukrposhta" in low:
+            return "УкрПошта"
+        if "нова пошт" in low or "novaposhta" in low or "nova poshta" in low or "нова" == low.strip():
+            return "Нова Пошта"
+        return ""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in ("tgMessages", "items", "_id"):
+                continue
+            found = scan_carrier(v, depth + 1)
+            if found:
+                return found
+    if isinstance(value, list):
+        for v in value:
+            found = scan_carrier(v, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+CARRIER_PREFIX_RE = re.compile(r"^\s*(Нова Пошта|УкрПошта)\s*[:—-]\s*", re.IGNORECASE)
+
+
+def split_department(order: dict) -> tuple:
+    dept = str(order.get("department") or "")
+    match = CARRIER_PREFIX_RE.match(dept)
+    if match:
+        return match.group(1), dept[match.end():]
+    return "", dept
+
+
 def get_carrier(order: dict) -> str:
-    return pick_field(order, CARRIER_KEYS)
+    return (
+        pick_field(order, CARRIER_KEYS)
+        or split_department(order)[0]
+        or scan_carrier(order)
+    )
 
 
 def get_payment(order: dict) -> str:
@@ -341,13 +382,14 @@ async def fmt_order_card(order: dict) -> str:
     if payment:
         carrier_line += f"\n💳 Оплата: {esc(payment)}"
     full_name = f"{customer.get('name', '')} {customer.get('surname', '')}".strip()
+    dept_text = split_department(order)[1]
 
     return (
         f"{STATUS_EMOJI.get(status, '🆕')} *Замовлення* №`{order.get('_id')}`\n\n"
         f"{fmt_order_items(order)}\n\n"
         f"👤 {esc(full_name)}\n"
         f"📞 {esc(phone)}\n"
-        f"📍 {esc(order.get('city', ''))}, відділення {esc(order.get('department', ''))}"
+        f"📍 {esc(order.get('city', ''))}, відділення {esc(dept_text)}"
         f"{carrier_line}\n\n"
         f"💰 Сума: {fmt_money(revenue)} грн\n"
         f"🚚 Доставка: {fmt_money(order.get('deliveryCost', 0) or 0)} грн\n"
@@ -1065,6 +1107,18 @@ async def new_order_poll_task():
             ) or []
             uids = await get_all_uids()
             for order in new_orders:
+                claimed = await db_call(
+                    orders_col.find_one_and_update(
+                        {"_id": order["_id"], "notified": {"$ne": True}},
+                        {"$set": {"notified": True}},
+                        return_document=ReturnDocument.AFTER,
+                    ),
+                    default=None,
+                    raise_on_fail=False,
+                )
+                if not claimed:
+                    continue
+                order = claimed
                 needs_persist = order_needs_enrich(order)
                 await normalize_order(order)
                 if needs_persist:
@@ -1075,12 +1129,18 @@ async def new_order_poll_task():
                         ),
                         raise_on_fail=False,
                     )
+                sent_any = False
                 for uid in uids:
                     try:
                         await send_order_card(uid, order)
+                        sent_any = True
                     except Exception:
                         logger.exception("Failed to send new order notice to %s", uid)
-                await db_call(orders_col.update_one({"_id": order["_id"]}, {"$set": {"notified": True}}), raise_on_fail=False)
+                if uids and not sent_any:
+                    await db_call(
+                        orders_col.update_one({"_id": order["_id"]}, {"$set": {"notified": False}}),
+                        raise_on_fail=False,
+                    )
         except Exception:
             logger.exception("new_order_poll_task failed")
 
