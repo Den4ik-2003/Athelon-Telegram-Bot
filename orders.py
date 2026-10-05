@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -60,7 +61,6 @@ STATUS_EMOJI = {
     "успішно": "✅",
     "відмовлено": "❌",
 }
-# Кольорові кружечки для візуального статусу замовлення
 STATUS_COLOR = {
     "новий": "⚪",
     "в обробці": "🟡",
@@ -70,6 +70,8 @@ STATUS_COLOR = {
     "відмовлено": "🔴",
 }
 NOT_SHIPPED_STATUSES = ["новий", "в обробці"]
+
+PRODUCTS_TTL = 60
 
 mongo_client: AsyncIOMotorClient | None = None
 db = None
@@ -81,6 +83,8 @@ notes_col = None
 online_history_col = None
 
 authorized_uids: set[int] = set()
+products_cache: dict = {"ts": 0.0, "map": {}}
+
 
 def init_mongo():
     global mongo_client, db, orders_col, products_col, visitors_col, auth_col, notes_col, online_history_col
@@ -100,8 +104,10 @@ def init_mongo():
     notes_col = db["customer_notes"]
     online_history_col = db["online_history"]
 
+
 class DBUnavailable(Exception):
     pass
+
 
 async def db_call(coro, default=None, retries=2, raise_on_fail=True):
     last_exc = None
@@ -118,6 +124,7 @@ async def db_call(coro, default=None, retries=2, raise_on_fail=True):
         raise DBUnavailable(str(last_exc)) from last_exc
     return default
 
+
 async def is_authorized(uid: int) -> bool:
     if uid in authorized_uids:
         return True
@@ -127,9 +134,11 @@ async def is_authorized(uid: int) -> bool:
         return True
     return False
 
+
 async def authorize(uid: int):
     authorized_uids.add(uid)
     await db_call(auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True))
+
 
 async def load_authorized_uids():
     cursor = auth_col.find({}, {"_id": 0, "uid": 1})
@@ -139,12 +148,102 @@ async def load_authorized_uids():
             authorized_uids.add(d["uid"])
     logger.info("Loaded %d authorized users into cache", len(authorized_uids))
 
+
 async def get_all_uids() -> list:
     if authorized_uids:
         return list(authorized_uids)
     cursor = auth_col.find({}, {"_id": 0, "uid": 1})
     docs = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
     return [d["uid"] for d in docs if "uid" in d]
+
+
+def num(v, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def esc(v) -> str:
+    return re.sub(r"([_*`\[])", r"\\\1", str(v if v is not None else ""))
+
+
+def fmt_money(v: float) -> str:
+    return f"{v:,.0f}".replace(",", " ")
+
+
+def item_pid(item: dict) -> str:
+    for key in ("id", "productId", "product_id"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+async def get_products_map(force: bool = False) -> dict:
+    now = time.monotonic()
+    if not force and products_cache["map"] and now - products_cache["ts"] < PRODUCTS_TTL:
+        return products_cache["map"]
+    docs = await db_call(
+        products_col.find({}, {"images": 0}).to_list(length=None),
+        default=None,
+        raise_on_fail=False,
+    )
+    if docs is None:
+        return products_cache["map"]
+    mapping = {}
+    for p in docs:
+        if p.get("id") not in (None, ""):
+            mapping[str(p["id"])] = p
+        mapping[str(p["_id"])] = p
+    products_cache["ts"] = now
+    products_cache["map"] = mapping
+    return mapping
+
+
+def order_needs_enrich(order: dict) -> bool:
+    if not num(order.get("total")):
+        return True
+    return any(not num(i.get("price")) for i in order.get("items") or [])
+
+
+async def normalize_order(order: dict) -> dict:
+    products = await get_products_map()
+    items = []
+    for i in order.get("items") or []:
+        pid = item_pid(i)
+        p = products.get(pid) or {}
+        qty = int(num(i.get("quantity"), 1)) or 1
+        price = (
+            num(i.get("price"))
+            or num(i.get("unitPrice"))
+            or num(p.get("newPrice"))
+            or num(p.get("price"))
+        )
+        cost = num(i.get("costPrice")) or num(p.get("costPrice"))
+        items.append({
+            **i,
+            "id": pid,
+            "name": i.get("name") or p.get("name") or "Товар",
+            "size": i.get("size") or "",
+            "color": i.get("color") or p.get("color") or "",
+            "quantity": qty,
+            "price": price,
+            "costPrice": cost,
+        })
+    order["items"] = items
+    if not num(order.get("total")):
+        order["total"] = sum(it["price"] * it["quantity"] for it in items)
+    return order
+
+
+async def normalize_orders(orders: list) -> list:
+    for o in orders:
+        await normalize_order(o)
+    return orders
+
 
 def order_profit(order: dict) -> float:
     items = order.get("items") or []
@@ -153,24 +252,36 @@ def order_profit(order: dict) -> float:
     delivery = order.get("deliveryCost") or 0
     return revenue - cost - delivery
 
+
 def order_revenue(order: dict) -> float:
     return order.get("total") or 0
 
-def fmt_money(v: float) -> str:
-    return f"{v:,.0f}".replace(",", " ")
 
 def fmt_order_items(order: dict) -> str:
     lines = []
     for i in order.get("items") or []:
-        size = f", {i.get('size')}" if i.get("size") else ""
-        color = f", {i.get('color')}" if i.get("color") else ""
-        lines.append(f"• {i.get('name','')}{size}{color} × {i.get('quantity',1)} — {fmt_money(i.get('price',0))} грн")
+        qty = i.get("quantity") or 1
+        line_total = (i.get("price") or 0) * qty
+        meta = []
+        if i.get("id"):
+            meta.append(f"🆔 {esc(i['id'])}")
+        if i.get("color"):
+            meta.append(f"🎨 {esc(i['color'])}")
+        if i.get("size"):
+            meta.append(f"📏 {esc(i['size'])}")
+        meta.append(f"× {qty}")
+        lines.append(
+            f"• *{esc(i.get('name', ''))}*\n"
+            f"   {' · '.join(meta)} — {fmt_money(line_total)} грн"
+        )
     return "\n".join(lines) if lines else "—"
+
 
 async def get_repeat_count(phone: str) -> int:
     if not phone:
         return 0
     return await db_call(orders_col.count_documents({"customer.phone": phone}), default=0, raise_on_fail=False) or 0
+
 
 async def get_customer_note(phone: str) -> str:
     if not phone:
@@ -178,7 +289,9 @@ async def get_customer_note(phone: str) -> str:
     doc = await db_call(notes_col.find_one({"_id": phone}), default=None, raise_on_fail=False)
     return doc.get("text", "") if doc else ""
 
+
 async def fmt_order_card(order: dict) -> str:
+    await normalize_order(order)
     customer = order.get("customer") or {}
     phone = customer.get("phone", "")
     status = order.get("status", "новий")
@@ -188,20 +301,25 @@ async def fmt_order_card(order: dict) -> str:
     note = await get_customer_note(phone)
 
     repeat_line = "🆕 Новий клієнт" if repeat_count <= 1 else f"🔄 Повторний клієнт: {repeat_count} замовлень"
-    note_line = f"\n📝 Нотатка: {note}" if note else ""
+    note_line = f"\n📝 Нотатка: {esc(note)}" if note else ""
+    carrier = order.get("carrier") or customer.get("carrier") or ""
+    carrier_line = f"\n🚛 Перевізник: {esc(carrier)}" if carrier else ""
+    full_name = f"{customer.get('name', '')} {customer.get('surname', '')}".strip()
 
     return (
-        f"{STATUS_EMOJI.get(status,'🆕')} *Замовлення* #{str(order.get('_id'))[-6:]}\n\n"
+        f"{STATUS_EMOJI.get(status, '🆕')} *Замовлення* №`{order.get('_id')}`\n\n"
         f"{fmt_order_items(order)}\n\n"
-        f"👤 {customer.get('name','')} {customer.get('surname','')}\n"
-        f"📞 {phone}\n"
-        f"📍 {order.get('city','')}, відділення {order.get('department','')}\n\n"
+        f"👤 {esc(full_name)}\n"
+        f"📞 {esc(phone)}\n"
+        f"📍 {esc(order.get('city', ''))}, відділення {esc(order.get('department', ''))}"
+        f"{carrier_line}\n\n"
         f"💰 Сума: {fmt_money(revenue)} грн\n"
-        f"🚚 Доставка: {fmt_money(order.get('deliveryCost',0))} грн\n"
+        f"🚚 Доставка: {fmt_money(order.get('deliveryCost', 0) or 0)} грн\n"
         f"📈 Прибуток: {fmt_money(profit)} грн\n\n"
         f"{repeat_line}{note_line}\n\n"
-        f"{STATUS_COLOR.get(status,'⚪')} Статус: *{status}*"
+        f"{STATUS_COLOR.get(status, '⚪')} Статус: *{status}*"
     )
+
 
 def ikb_order_actions(order_id: str) -> InlineKeyboardMarkup:
     rows = []
@@ -222,23 +340,29 @@ def ikb_order_actions(order_id: str) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def ikb_delete_confirm(order_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"delyes:{order_id}"),
         InlineKeyboardButton(text="↩️ Ні", callback_data=f"delno:{order_id}"),
     ]])
 
+
 class SetDelivery(StatesGroup):
     typing = State()
+
 
 class SetNote(StatesGroup):
     typing = State()
 
+
 class LookupCustomer(StatesGroup):
     typing = State()
 
+
 class Auth(StatesGroup):
     waiting_password = State()
+
 
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
@@ -249,8 +373,10 @@ def kb_main() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🔍 Клієнт за телефоном"), KeyboardButton(text="📈 Онлайн за 24 год")],
     ], resize_keyboard=True)
 
+
 def kb_cancel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Скасувати")]], resize_keyboard=True)
+
 
 def ikb_period(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -259,6 +385,7 @@ def ikb_period(prefix: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Місяць", callback_data=f"{prefix}:month"),
         InlineKeyboardButton(text="Весь час", callback_data=f"{prefix}:all"),
     ]])
+
 
 def period_start(period: str) -> datetime | None:
     now = datetime.now()
@@ -270,9 +397,7 @@ def period_start(period: str) -> datetime | None:
         return now - timedelta(days=30)
     return None
 
-# ---------------------------------------------------------------------------
-# Унікальні відвідувачі (дедуплікація за IP)
-# ---------------------------------------------------------------------------
+
 async def get_unique_visitors_count(since: datetime | None = None) -> int:
     query = {}
     if since is not None:
@@ -282,13 +407,11 @@ async def get_unique_visitors_count(since: datetime | None = None) -> int:
     ) or []
     return len([ip for ip in ips if ip])
 
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ---------------------------------------------------------------------------
-# Відправка карток замовлень із запам'ятовуванням повідомлень,
-# щоб їх можна було видалити з Telegram разом із замовленням
-# ---------------------------------------------------------------------------
+
 async def track_message(order_id, chat_id: int, message_id: int):
     await db_call(
         orders_col.update_one(
@@ -298,6 +421,7 @@ async def track_message(order_id, chat_id: int, message_id: int):
         raise_on_fail=False,
     )
 
+
 async def send_order_card(chat_id: int, order: dict):
     text = await fmt_order_card(order)
     sent = await bot.send_message(
@@ -305,6 +429,7 @@ async def send_order_card(chat_id: int, order: dict):
     )
     await track_message(order["_id"], chat_id, sent.message_id)
     return sent
+
 
 async def delete_order_everywhere(order: dict, current_msg: Message | None = None):
     refs = {(r.get("chat_id"), r.get("message_id")) for r in (order.get("tgMessages") or [])}
@@ -317,6 +442,7 @@ async def delete_order_everywhere(order: dict, current_msg: Message | None = Non
             await bot.delete_message(chat_id, message_id)
         except Exception:
             logger.warning("Could not delete message %s in chat %s", message_id, chat_id)
+
 
 async def require_auth(msg: Message, state: FSMContext) -> bool:
     try:
@@ -331,6 +457,7 @@ async def require_auth(msg: Message, state: FSMContext) -> bool:
         await state.set_state(Auth.waiting_password)
         await msg.answer("🔒 *Доступ закритий*\n\nВведіть пароль:", reply_markup=ReplyKeyboardRemove())
     return False
+
 
 @dp.errors()
 async def global_error_handler(event, exception=None):
@@ -352,12 +479,14 @@ async def global_error_handler(event, exception=None):
             pass
     return True
 
+
 async def build_dashboard_text() -> str:
     today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     today_orders = await db_call(
-        orders_col.find({"createdAt": {"$gte": today_start}}, {"_id": 0}).to_list(length=None),
+        orders_col.find({"createdAt": {"$gte": today_start}}).to_list(length=None),
         default=[], raise_on_fail=False
     ) or []
+    await normalize_orders(today_orders)
 
     total_count = len(today_orders)
     done_count = sum(1 for o in today_orders if o.get("status") == "успішно")
@@ -399,6 +528,7 @@ async def build_dashboard_text() -> str:
     lines.append(f"🎯 Конверсія: {conversion_text}")
     return "\n".join(lines)
 
+
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
@@ -417,6 +547,7 @@ async def cmd_start(msg: Message, state: FSMContext):
         await state.set_state(Auth.waiting_password)
         await msg.answer("🔒 *Доступ закритий*\n\nВведіть пароль:", reply_markup=ReplyKeyboardRemove())
 
+
 @dp.message(Auth.waiting_password)
 async def check_password(msg: Message, state: FSMContext):
     if msg.text == BOT_PASSWORD:
@@ -434,6 +565,7 @@ async def check_password(msg: Message, state: FSMContext):
     else:
         await msg.answer("❌ Невірний пароль. Спробуй ще раз:")
 
+
 @dp.message(F.text == "🎯 Дашборд")
 async def dashboard_cmd(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -441,6 +573,7 @@ async def dashboard_cmd(msg: Message, state: FSMContext):
         await msg.answer(await build_dashboard_text(), reply_markup=kb_main())
     except DBUnavailable:
         await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
 
 @dp.message(F.text == "📦 Не відправлені")
 async def not_shipped_cmd(msg: Message, state: FSMContext):
@@ -457,10 +590,12 @@ async def not_shipped_cmd(msg: Message, state: FSMContext):
     for o in orders[:15]:
         await send_order_card(msg.chat.id, o)
 
+
 @dp.message(F.text == "📋 Замовлення")
 async def orders_list_cmd(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     await msg.answer("Оберіть період:", reply_markup=ikb_period("allorders"))
+
 
 @dp.callback_query(F.data.startswith("allorders:"))
 async def orders_list_period_cb(cb: CallbackQuery):
@@ -489,10 +624,12 @@ async def orders_list_period_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+
 @dp.message(F.text == "💸 Виручка і прибуток")
 async def revenue_cmd(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     await msg.answer("Оберіть період:", reply_markup=ikb_period("revenue"))
+
 
 @dp.callback_query(F.data.startswith("revenue:"))
 async def revenue_period_cb(cb: CallbackQuery):
@@ -501,6 +638,7 @@ async def revenue_period_cb(cb: CallbackQuery):
         start = period_start(period)
         query = {"createdAt": {"$gte": start}} if start else {}
         orders = await db_call(orders_col.find(query).to_list(length=None), default=[], raise_on_fail=False) or []
+        await normalize_orders(orders)
         active = [o for o in orders if o.get("status") != "відмовлено"]
         revenue = sum(order_revenue(o) for o in active)
         profit = sum(order_profit(o) for o in active)
@@ -520,10 +658,12 @@ async def revenue_period_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+
 @dp.message(F.text == "🔥 Топ товарів")
 async def top_products_cmd(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     await msg.answer("Оберіть період:", reply_markup=ikb_period("topprod"))
+
 
 @dp.callback_query(F.data.startswith("topprod:"))
 async def top_products_cb(cb: CallbackQuery):
@@ -532,6 +672,7 @@ async def top_products_cb(cb: CallbackQuery):
         start = period_start(period)
         query = {"createdAt": {"$gte": start}} if start else {}
         orders = await db_call(orders_col.find(query).to_list(length=None), default=[], raise_on_fail=False) or []
+        await normalize_orders(orders)
         counts: dict = {}
         for o in orders:
             if o.get("status") == "відмовлено":
@@ -545,7 +686,7 @@ async def top_products_cb(cb: CallbackQuery):
         else:
             lines = ["🔥 *Топ товарів*", ""]
             for i, (name, qty) in enumerate(top, 1):
-                lines.append(f"{i}. {name} — {qty} шт.")
+                lines.append(f"{i}. {esc(name)} — {qty} шт.")
             text = "\n".join(lines)
         await cb.message.edit_text(text, reply_markup=ikb_period("topprod"))
         await cb.answer()
@@ -555,6 +696,7 @@ async def top_products_cb(cb: CallbackQuery):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
+
 
 @dp.message(F.text == "👥 Онлайн зараз")
 async def online_now_cmd(msg: Message, state: FSMContext):
@@ -567,6 +709,7 @@ async def online_now_cmd(msg: Message, state: FSMContext):
     except Exception:
         logger.exception("online_now_cmd failed")
         await msg.answer(API_ERROR_TEXT, reply_markup=kb_main())
+
 
 @dp.message(F.text == "📊 Аналітика сайту")
 async def site_analytics_cmd(msg: Message, state: FSMContext):
@@ -605,6 +748,7 @@ async def site_analytics_cmd(msg: Message, state: FSMContext):
         f"🎯 Конверсія сьогодні (унікальні): *{conversion_unique}*"
     )
     await msg.answer(text, reply_markup=kb_main())
+
 
 @dp.message(F.text == "📱 Пристрої")
 async def devices_cmd(msg: Message, state: FSMContext):
@@ -658,11 +802,13 @@ async def devices_cmd(msg: Message, state: FSMContext):
         lines.append(f"{name}: {c} ({pct}%)")
     await msg.answer("\n".join(lines), reply_markup=kb_main())
 
+
 @dp.message(F.text == "🔍 Клієнт за телефоном")
 async def lookup_customer_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     await state.set_state(LookupCustomer.typing)
     await msg.answer("📞 Введіть номер телефону клієнта:", reply_markup=kb_cancel())
+
 
 @dp.message(LookupCustomer.typing)
 async def lookup_customer_save(msg: Message, state: FSMContext):
@@ -679,17 +825,19 @@ async def lookup_customer_save(msg: Message, state: FSMContext):
     if not orders:
         return await msg.answer("📭 Замовлень з таким номером не знайдено.", reply_markup=kb_main())
 
+    await normalize_orders(orders)
     total_spent = sum(order_revenue(o) for o in orders if o.get("status") != "відмовлено")
     note = await get_customer_note(phone)
-    note_line = f"\n📝 Нотатка: {note}" if note else "\n📝 Нотатки немає"
+    note_line = f"\n📝 Нотатка: {esc(note)}" if note else "\n📝 Нотатки немає"
     text = (
-        f"📞 *{phone}*\n\n"
+        f"📞 *{esc(phone)}*\n\n"
         f"🛒 Всього замовлень: *{len(orders)}*\n"
         f"💰 Всього витрачено: *{fmt_money(total_spent)} грн*{note_line}"
     )
     await msg.answer(text, reply_markup=kb_main())
     for o in orders[:5]:
         await send_order_card(msg.chat.id, o)
+
 
 @dp.message(F.text == "📈 Онлайн за 24 год")
 async def online_history_cmd(msg: Message, state: FSMContext):
@@ -715,6 +863,7 @@ async def online_history_cmd(msg: Message, state: FSMContext):
     buf.seek(0)
     await msg.answer_photo(BufferedInputFile(buf.read(), filename="online.png"), reply_markup=kb_main())
 
+
 @dp.callback_query(F.data.startswith("setstatus:"))
 async def set_status_cb(cb: CallbackQuery):
     try:
@@ -735,9 +884,7 @@ async def set_status_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
-# ---------------------------------------------------------------------------
-# Видалення замовлення (з підтвердженням): з БД і з Telegram
-# ---------------------------------------------------------------------------
+
 @dp.callback_query(F.data.startswith("delask:"))
 async def delete_ask_cb(cb: CallbackQuery):
     try:
@@ -753,6 +900,7 @@ async def delete_ask_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+
 @dp.callback_query(F.data.startswith("delno:"))
 async def delete_cancel_cb(cb: CallbackQuery):
     try:
@@ -765,6 +913,7 @@ async def delete_cancel_cb(cb: CallbackQuery):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
+
 
 @dp.callback_query(F.data.startswith("delyes:"))
 async def delete_confirm_cb(cb: CallbackQuery):
@@ -791,6 +940,7 @@ async def delete_confirm_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+
 @dp.callback_query(F.data.startswith("setdelivery:"))
 async def set_delivery_start(cb: CallbackQuery, state: FSMContext):
     try:
@@ -805,6 +955,7 @@ async def set_delivery_start(cb: CallbackQuery, state: FSMContext):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
+
 
 @dp.message(SetDelivery.typing)
 async def set_delivery_save(msg: Message, state: FSMContext):
@@ -826,6 +977,7 @@ async def set_delivery_save(msg: Message, state: FSMContext):
         return await msg.answer("Замовлення не знайдено.", reply_markup=kb_main())
     await send_order_card(msg.chat.id, order)
 
+
 @dp.callback_query(F.data.startswith("setnote:"))
 async def set_note_start(cb: CallbackQuery, state: FSMContext):
     try:
@@ -836,7 +988,7 @@ async def set_note_start(cb: CallbackQuery, state: FSMContext):
         phone = (order.get("customer") or {}).get("phone", "")
         await state.set_state(SetNote.typing)
         await state.update_data(phone=phone, order_id=order_id)
-        await cb.message.answer(f"📝 Введіть нотатку для клієнта {phone}:", reply_markup=kb_cancel())
+        await cb.message.answer(f"📝 Введіть нотатку для клієнта {esc(phone)}:", reply_markup=kb_cancel())
         await cb.answer()
     except Exception:
         logger.exception("set_note_start failed")
@@ -844,6 +996,7 @@ async def set_note_start(cb: CallbackQuery, state: FSMContext):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
+
 
 @dp.message(SetNote.typing)
 async def set_note_save(msg: Message, state: FSMContext):
@@ -861,8 +1014,10 @@ async def set_note_save(msg: Message, state: FSMContext):
     if order:
         await send_order_card(msg.chat.id, order)
 
+
 online_alert_active = False
 site_down_active = False
+
 
 async def new_order_poll_task():
     while True:
@@ -874,6 +1029,16 @@ async def new_order_poll_task():
             ) or []
             uids = await get_all_uids()
             for order in new_orders:
+                needs_persist = order_needs_enrich(order)
+                await normalize_order(order)
+                if needs_persist:
+                    await db_call(
+                        orders_col.update_one(
+                            {"_id": order["_id"]},
+                            {"$set": {"items": order["items"], "total": order["total"]}},
+                        ),
+                        raise_on_fail=False,
+                    )
                 for uid in uids:
                     try:
                         await send_order_card(uid, order)
@@ -882,6 +1047,7 @@ async def new_order_poll_task():
                 await db_call(orders_col.update_one({"_id": order["_id"]}, {"$set": {"notified": True}}), raise_on_fail=False)
         except Exception:
             logger.exception("new_order_poll_task failed")
+
 
 async def online_snapshot_task():
     global online_alert_active
@@ -905,6 +1071,7 @@ async def online_snapshot_task():
                 online_alert_active = False
         except Exception:
             logger.exception("online_snapshot_task failed")
+
 
 async def site_health_task():
     global site_down_active
@@ -939,10 +1106,13 @@ async def site_health_task():
                 except Exception:
                     pass
 
+
 from aiohttp import web
+
 
 async def ping(request):
     return web.Response(status=204)
+
 
 async def main():
     init_mongo()
@@ -968,6 +1138,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Athelon orders bot запущено...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
