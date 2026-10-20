@@ -25,6 +25,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     BufferedInputFile,
 )
+from aiohttp import web
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
@@ -72,6 +73,17 @@ STATUS_COLOR = {
 }
 NOT_SHIPPED_STATUSES = ["новий", "в обробці"]
 
+CONTACT_STATUS_LABELS = {
+    "new": "нова",
+    "read": "прочитана",
+    "archived": "в архіві",
+}
+CONTACT_STATUS_EMOJI = {
+    "new": "🆕",
+    "read": "👁",
+    "archived": "🗄",
+}
+
 PRODUCTS_TTL = 60
 
 mongo_client: AsyncIOMotorClient | None = None
@@ -82,13 +94,14 @@ visitors_col = None
 auth_col = None
 notes_col = None
 online_history_col = None
+contacts_col = None
 
 authorized_uids: set[int] = set()
 products_cache: dict = {"ts": 0.0, "map": {}}
 
 
 def init_mongo():
-    global mongo_client, db, orders_col, products_col, visitors_col, auth_col, notes_col, online_history_col
+    global mongo_client, db, orders_col, products_col, visitors_col, auth_col, notes_col, online_history_col, contacts_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=8000,
@@ -104,6 +117,7 @@ def init_mongo():
     auth_col = db["bot_auth"]
     notes_col = db["customer_notes"]
     online_history_col = db["online_history"]
+    contacts_col = db["contacts"]
 
 
 class DBUnavailable(Exception):
@@ -399,6 +413,30 @@ async def fmt_order_card(order: dict) -> str:
     )
 
 
+def fmt_contact_card(contact: dict) -> str:
+    status = contact.get("status", "new")
+    created = contact.get("createdAt")
+    created_text = created.strftime("%d.%m.%Y %H:%M") if isinstance(created, datetime) else ""
+    lines = [
+        f"{CONTACT_STATUS_EMOJI.get(status, '🆕')} *Заявка з сайту* №`{contact.get('_id')}`",
+        "",
+        f"👤 {esc(contact.get('name', ''))}",
+    ]
+    if contact.get("phone"):
+        lines.append(f"📞 {esc(contact['phone'])}")
+    if contact.get("email"):
+        lines.append(f"✉️ {esc(contact['email'])}")
+    if contact.get("subject"):
+        lines.append(f"📌 {esc(contact['subject'])}")
+    lines.append("")
+    lines.append(f"💬 {esc(contact.get('message', ''))}")
+    if created_text:
+        lines.append("")
+        lines.append(f"🕒 {created_text}")
+    lines.append(f"Статус: *{CONTACT_STATUS_LABELS.get(status, status)}*")
+    return "\n".join(lines)
+
+
 def ikb_order_actions(order_id: str) -> InlineKeyboardMarkup:
     rows = []
     row = []
@@ -426,6 +464,33 @@ def ikb_delete_confirm(order_id: str) -> InlineKeyboardMarkup:
     ]])
 
 
+def ikb_contact_actions(contact_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👁 Прочитано", callback_data=f"cstatus:{contact_id}:read"),
+            InlineKeyboardButton(text="🗄 В архів", callback_data=f"cstatus:{contact_id}:archived"),
+        ],
+        [
+            InlineKeyboardButton(text="🗑 Видалити", callback_data=f"cdelask:{contact_id}"),
+        ],
+    ])
+
+
+def ikb_contact_delete_confirm(contact_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"cdelyes:{contact_id}"),
+        InlineKeyboardButton(text="↩️ Ні", callback_data=f"cdelno:{contact_id}"),
+    ]])
+
+
+def ikb_contacts_filter() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🆕 Нові", callback_data="contacts:new"),
+        InlineKeyboardButton(text="👁 Прочитані", callback_data="contacts:read"),
+        InlineKeyboardButton(text="🗄 Архів", callback_data="contacts:archived"),
+    ]])
+
+
 class SetDelivery(StatesGroup):
     typing = State()
 
@@ -445,10 +510,11 @@ class Auth(StatesGroup):
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎯 Дашборд"), KeyboardButton(text="📋 Замовлення")],
-        [KeyboardButton(text="📦 Не відправлені"), KeyboardButton(text="💸 Виручка і прибуток")],
-        [KeyboardButton(text="🔥 Топ товарів"), KeyboardButton(text="👥 Онлайн зараз")],
-        [KeyboardButton(text="📊 Аналітика сайту"), KeyboardButton(text="📱 Пристрої")],
-        [KeyboardButton(text="🔍 Клієнт за телефоном"), KeyboardButton(text="📈 Онлайн за 24 год")],
+        [KeyboardButton(text="📦 Не відправлені"), KeyboardButton(text="📩 Заявки")],
+        [KeyboardButton(text="💸 Виручка і прибуток"), KeyboardButton(text="🔥 Топ товарів")],
+        [KeyboardButton(text="👥 Онлайн зараз"), KeyboardButton(text="📊 Аналітика сайту")],
+        [KeyboardButton(text="📱 Пристрої"), KeyboardButton(text="🔍 Клієнт за телефоном")],
+        [KeyboardButton(text="📈 Онлайн за 24 год")],
     ], resize_keyboard=True)
 
 
@@ -500,12 +566,30 @@ async def track_message(order_id, chat_id: int, message_id: int):
     )
 
 
+async def track_contact_message(contact_id, chat_id: int, message_id: int):
+    await db_call(
+        contacts_col.update_one(
+            {"_id": contact_id},
+            {"$push": {"tgMessages": {"chat_id": chat_id, "message_id": message_id}}},
+        ),
+        raise_on_fail=False,
+    )
+
+
 async def send_order_card(chat_id: int, order: dict):
     text = await fmt_order_card(order)
     sent = await bot.send_message(
         chat_id, text, reply_markup=ikb_order_actions(str(order["_id"]))
     )
     await track_message(order["_id"], chat_id, sent.message_id)
+    return sent
+
+
+async def send_contact_card(chat_id: int, contact: dict):
+    sent = await bot.send_message(
+        chat_id, fmt_contact_card(contact), reply_markup=ikb_contact_actions(str(contact["_id"]))
+    )
+    await track_contact_message(contact["_id"], chat_id, sent.message_id)
     return sent
 
 
@@ -572,6 +656,9 @@ async def build_dashboard_text() -> str:
     not_shipped = sum(1 for o in today_orders if o.get("status") in NOT_SHIPPED_STATUSES)
     revenue = sum(order_revenue(o) for o in today_orders if o.get("status") != "відмовлено")
     profit = sum(order_profit(o) for o in today_orders if o.get("status") != "відмовлено")
+    new_contacts = await db_call(
+        contacts_col.count_documents({"status": "new"}), default=0, raise_on_fail=False
+    ) or 0
 
     online = None
     visitors_today = None
@@ -594,7 +681,8 @@ async def build_dashboard_text() -> str:
         f"📦 Замовлень: *{total_count}*",
         f"✅ Успішних: *{done_count}*",
         f"❌ Відмов: *{refused_count}*",
-        f"🚚 Не відправлено: *{not_shipped}*", "",
+        f"🚚 Не відправлено: *{not_shipped}*",
+        f"📩 Нових заявок: *{new_contacts}*", "",
         f"💰 Виручка: *{fmt_money(revenue)} грн*",
         f"📈 Прибуток: *{fmt_money(profit)} грн*", "",
     ]
@@ -667,6 +755,125 @@ async def not_shipped_cmd(msg: Message, state: FSMContext):
     await msg.answer(f"📦 Не відправлено: *{len(orders)}*", reply_markup=kb_main())
     for o in orders[:15]:
         await send_order_card(msg.chat.id, o)
+
+
+@dp.message(F.text == "📩 Заявки")
+async def contacts_cmd(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    try:
+        new_count = await db_call(contacts_col.count_documents({"status": "new"}))
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+    await msg.answer(f"📩 Нових заявок: *{new_count}*\nОберіть розділ:", reply_markup=ikb_contacts_filter())
+
+
+@dp.callback_query(F.data.startswith("contacts:"))
+async def contacts_filter_cb(cb: CallbackQuery):
+    try:
+        if not await is_authorized(cb.from_user.id):
+            return await cb.answer("Немає доступу", show_alert=True)
+        status = cb.data.split(":")[1]
+        contacts = await db_call(
+            contacts_col.find({"status": status}).sort("createdAt", -1).to_list(length=None),
+            default=[], raise_on_fail=False
+        ) or []
+        title = CONTACT_STATUS_LABELS.get(status, status)
+        if not contacts:
+            await cb.message.edit_text(f"📭 Заявок зі статусом «{title}» немає.", reply_markup=ikb_contacts_filter())
+            return await cb.answer()
+        await cb.message.edit_text(f"📩 Заявок «{title}»: *{len(contacts)}*", reply_markup=ikb_contacts_filter())
+        await cb.answer()
+        for c in contacts[:15]:
+            await send_contact_card(cb.message.chat.id, c)
+        if len(contacts) > 15:
+            await cb.message.answer(f"…і ще {len(contacts) - 15} заявок.")
+    except Exception:
+        logger.exception("contacts_filter_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data.startswith("cstatus:"))
+async def contact_status_cb(cb: CallbackQuery):
+    try:
+        if not await is_authorized(cb.from_user.id):
+            return await cb.answer("Немає доступу", show_alert=True)
+        _, contact_id, status = cb.data.split(":")
+        if status not in CONTACT_STATUS_LABELS:
+            return await cb.answer("Невідомий статус", show_alert=True)
+        contact = await db_call(
+            contacts_col.find_one_and_update(
+                {"_id": ObjectId(contact_id)},
+                {"$set": {"status": status}},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        if not contact:
+            return await cb.answer("Заявку не знайдено", show_alert=True)
+        await cb.message.edit_text(fmt_contact_card(contact), reply_markup=ikb_contact_actions(contact_id))
+        await cb.answer(f"Статус: {CONTACT_STATUS_LABELS[status]}")
+    except Exception:
+        logger.exception("contact_status_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data.startswith("cdelask:"))
+async def contact_delete_ask_cb(cb: CallbackQuery):
+    try:
+        if not await is_authorized(cb.from_user.id):
+            return await cb.answer("Немає доступу", show_alert=True)
+        contact_id = cb.data.split(":")[1]
+        await cb.message.edit_reply_markup(reply_markup=ikb_contact_delete_confirm(contact_id))
+        await cb.answer("Підтвердіть видалення")
+    except Exception:
+        logger.exception("contact_delete_ask_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data.startswith("cdelno:"))
+async def contact_delete_cancel_cb(cb: CallbackQuery):
+    try:
+        contact_id = cb.data.split(":")[1]
+        await cb.message.edit_reply_markup(reply_markup=ikb_contact_actions(contact_id))
+        await cb.answer("Скасовано")
+    except Exception:
+        logger.exception("contact_delete_cancel_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data.startswith("cdelyes:"))
+async def contact_delete_confirm_cb(cb: CallbackQuery):
+    try:
+        if not await is_authorized(cb.from_user.id):
+            return await cb.answer("Немає доступу", show_alert=True)
+        oid = ObjectId(cb.data.split(":")[1])
+        contact = await db_call(contacts_col.find_one({"_id": oid}))
+        if not contact:
+            try:
+                await cb.message.delete()
+            except Exception:
+                pass
+            return await cb.answer("Заявку вже видалено", show_alert=True)
+        await db_call(contacts_col.delete_one({"_id": oid}))
+        await delete_order_everywhere(contact, current_msg=cb.message)
+        await cb.answer("🗑 Заявку видалено")
+    except Exception:
+        logger.exception("contact_delete_confirm_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
 
 
 @dp.message(F.text == "📋 Замовлення")
@@ -1145,6 +1352,43 @@ async def new_order_poll_task():
             logger.exception("new_order_poll_task failed")
 
 
+async def new_contact_poll_task():
+    while True:
+        await asyncio.sleep(10)
+        try:
+            new_contacts = await db_call(
+                contacts_col.find({"notified": {"$ne": True}}).sort("createdAt", 1).to_list(length=None),
+                default=[], raise_on_fail=False
+            ) or []
+            uids = await get_all_uids()
+            for contact in new_contacts:
+                claimed = await db_call(
+                    contacts_col.find_one_and_update(
+                        {"_id": contact["_id"], "notified": {"$ne": True}},
+                        {"$set": {"notified": True}},
+                        return_document=ReturnDocument.AFTER,
+                    ),
+                    default=None,
+                    raise_on_fail=False,
+                )
+                if not claimed:
+                    continue
+                sent_any = False
+                for uid in uids:
+                    try:
+                        await send_contact_card(uid, claimed)
+                        sent_any = True
+                    except Exception:
+                        logger.exception("Failed to send new contact notice to %s", uid)
+                if uids and not sent_any:
+                    await db_call(
+                        contacts_col.update_one({"_id": claimed["_id"]}, {"$set": {"notified": False}}),
+                        raise_on_fail=False,
+                    )
+        except Exception:
+            logger.exception("new_contact_poll_task failed")
+
+
 async def online_snapshot_task():
     global online_alert_active
     while True:
@@ -1203,9 +1447,6 @@ async def site_health_task():
                     pass
 
 
-from aiohttp import web
-
-
 async def ping(request):
     return web.Response(status=204)
 
@@ -1228,6 +1469,7 @@ async def main():
     await site.start()
 
     asyncio.create_task(new_order_poll_task())
+    asyncio.create_task(new_contact_poll_task())
     asyncio.create_task(online_snapshot_task())
     asyncio.create_task(site_health_task())
 
